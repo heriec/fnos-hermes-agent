@@ -2453,12 +2453,30 @@ export async function handleCustomRoute(req) {
 
   // ── 模型添加全链路同步（P0 核心：providers-state.yaml → Hermes config.yaml + .env） ──
   function _upsertYamlBlock(yml, key, blockLines) {
-    // 替换或插入顶层键 blockLines（含缩进）；找不到则追加
-    const re = new RegExp(`^${key}:[\\s\\S]*?(?=^[a-zA-Z_][a-zA-Z0-9_]*:\\s*$|\\n\\S)`, "m");
-    if (re.test(yml)) {
-      return yml.replace(re, blockLines.join("\n") + "\n");
+    // 按行替换顶层键块（含缩进子行），删除全部重复键，新块放首个出现位置。
+    // 旧正则实现无法命中"段在文件末尾"的结束位置，会追加新块造成重复顶层键
+    // （同 monitor.js _replaceTopLevelKey 修复过的问题）；找不到该键则追加到末尾
+    const block = blockLines.join("\n") + "\n";
+    const lines = String(yml || "").split("\n");
+    const hits = [];
+    lines.forEach((l, i) => {
+      if (/^\s/.test(l)) return;
+      if (l === key + ":" || l.startsWith(key + ":")) hits.push(i);
+    });
+    if (!hits.length) return (yml.endsWith("\n") || yml === "") ? yml + block : yml + "\n" + block;
+    const out = [];
+    let inserted = false;
+    for (let i = 0; i < lines.length; i++) {
+      if (hits.indexOf(i) !== -1) {
+        if (!inserted) { out.push(block); inserted = true; }
+        let j = i + 1;
+        while (j < lines.length && (lines[j].startsWith(" ") || lines[j].startsWith("\t"))) j++;
+        i = j - 1;
+        continue;
+      }
+      out.push(lines[i]);
     }
-    return yml.replace(/\n?$/, "\n") + blockLines.join("\n") + "\n";
+    return out.join("\n");
   }
   function _readEnvFile() { try { return readFileSync(HERMES_ENV, "utf8"); } catch (e) { return ""; } }
   function _writeEnvKey(env, key, value) {
@@ -2466,6 +2484,39 @@ export async function handleCustomRoute(req) {
     const line = `${key}=${value}`;
     if (re.test(env)) return env.replace(re, line);
     return env.replace(/\n?$/, "\n") + line + "\n";
+  }
+  // 提取 config.yaml providers: 段里每个 provider 面板不管理的原始行
+  // （base_url / api_key / default_model 之外，如 extra_headers、name），
+  // 同步重建该段时原样回填，避免手加字段被全量重写抹掉
+  function _collectProvidersExtras(yml) {
+    const extras = {};
+    try {
+      const m = yml.match(/^providers:\n([\s\S]*?)(?=^[a-zA-Z_][a-zA-Z0-9_-]*:|\n\S|(?![\s\S]))/m);
+      if (!m) return extras;
+      let curId = null;
+      m[1].split("\n").forEach(line => {
+        const idm = line.match(/^  ([a-zA-Z0-9_-]+):\s*$/);
+        if (idm) { curId = idm[1]; extras[curId] = []; return; }
+        if (!curId || !/^ {4,}\S/.test(line)) return;
+        if (/^ {4}(base_url|api_key|default_model):/.test(line)) return;
+        extras[curId].push(line);
+      });
+      Object.keys(extras).forEach(k => { if (!extras[k].length) delete extras[k]; });
+    } catch (e) {}
+    return extras;
+  }
+  // 同上：model: 段里 provider / default 之外的子键（如 coding、default_headers）原样保留
+  function _collectModelExtras(yml) {
+    const lines = [];
+    try {
+      const m = yml.match(/^model:\n([\s\S]*?)(?=^[a-zA-Z_][a-zA-Z0-9_-]*:|\n\S|(?![\s\S]))/m);
+      if (!m) return lines;
+      m[1].split("\n").forEach(line => {
+        if (/^ {2}(provider|default|default_model):/.test(line)) return;
+        if (/^ {2,}\S/.test(line)) lines.push(line);
+      });
+    } catch (e) {}
+    return lines;
   }
   if (path === "/api/config/sync" && method === "POST") {
     try {
@@ -2481,8 +2532,9 @@ export async function handleCustomRoute(req) {
       } catch (e) {}
       const targetConfigs = _profileDir ? [_profileDir + "/config.yaml", HERMES_CONFIG] : [HERMES_CONFIG];
       const targetEnvs = _profileDir ? [_profileDir + "/.env", HERMES_ENV] : [HERMES_ENV];
-      // 1) 构建 Hermes config.yaml 的 providers 段 + 收集 env keys
-      const provLines = ["providers:"];
+      // 1) 构建每个 provider 面板管理的字段（base_url / api_key / default_model）+ 收集 env keys；
+      //    其余字段在步骤 2 写入各目标文件时从其现有 providers: 段原样回填
+      const provEntries = [];
       const envPairs = [];
       let hermesActiveId = activeId;
       let hermesActiveModel = "";
@@ -2492,10 +2544,14 @@ export async function handleCustomRoute(req) {
         const baseUrl = String(p.base_url || "").trim();
         const keyEnv = `CUSTOM_${id.toUpperCase()}_API_KEY`;
         if (baseUrl) {
-          provLines.push(`  ${id}:`);
-          provLines.push(`    base_url: ${baseUrl}`);
-          provLines.push(`    api_key: \${${keyEnv}}`);
-          provLines.push(`    default_model: ${model}`);
+          provEntries.push({
+            id,
+            lines: [
+              `    base_url: ${baseUrl}`,
+              `    api_key: \${${keyEnv}}`,
+              `    default_model: ${model}`,
+            ],
+          });
         }
         if (p.api_key && String(p.api_key).length > 4 && !String(p.api_key).startsWith("****")) {
           envPairs.push({ keyEnv, value: String(p.api_key) });
@@ -2505,15 +2561,24 @@ export async function handleCustomRoute(req) {
           hermesActiveModel = model;
         }
       });
-      // 2) 更新 config.yaml（备份 → 替换 providers 段 + model 段）——每个目标都写
+      // 2) 更新 config.yaml（备份 → 替换 providers 段 + model 段）——每个目标都写。
+      //    替换前从该文件现有段提取面板不管理的字段并回填（profile 与顶层两份
+      //    存量可能不同，必须逐文件提取，不能共用一份）
       const backups = [];
       targetConfigs.forEach(cfgPath => {
         let yml = "";
         try { yml = readFileSync(cfgPath, "utf8"); } catch (e) { return; }
         const bak = `${cfgPath}.sync-bak-${Date.now()}`;
         try { writeFileSync(bak, yml); backups.push(bak); } catch (e) {}
+        const provExtras = _collectProvidersExtras(yml);
+        const provLines = ["providers:"];
+        provEntries.forEach(e => {
+          provLines.push(`  ${e.id}:`);
+          e.lines.forEach(l => provLines.push(l));
+          (provExtras[e.id] || []).forEach(l => provLines.push(l));
+        });
         yml = _upsertYamlBlock(yml, "providers", provLines);
-        const modelBlock = [`model:`, `  provider: ${hermesActiveId || "default"}`, `  default: ${hermesActiveModel || "auto"}`];
+        const modelBlock = [`model:`, `  provider: ${hermesActiveId || "default"}`, `  default: ${hermesActiveModel || "auto"}`, ..._collectModelExtras(yml)];
         yml = _upsertYamlBlock(yml, "model", modelBlock);
         yml = yml.replace(/^fallback_providers:[\s\S]*?(?=^[a-zA-Z_][a-zA-Z0-9_]*:\s*$)/m, "fallback_providers: []\n");
         try { writeFileSync(cfgPath, yml); } catch (e) {}
