@@ -9464,6 +9464,43 @@ async function handleFetch(req) {
       const resolvedModel = allProvConfig[providerId]?.model || "auto";
       const yamlPath = `${DATA_DIR}/config.yaml`;
 
+      // 提取现有 config.yaml providers:/model: 段里面板不管理的字段（extra_headers、
+      // name、model.coding 等），下方重建这两个段时原样回填，避免手加配置被全量重写抹掉
+      // （与 custom_routes.js /api/config/sync 的修复保持同语义）
+      const _collectProviderExtras = (yml) => {
+        const extras = {};
+        try {
+          const m = String(yml || "").match(/^providers:\n([\s\S]*?)(?=^[a-zA-Z_][a-zA-Z0-9_-]*:|\n\S|(?![\s\S]))/m);
+          if (!m) return extras;
+          let curId = null;
+          m[1].split("\n").forEach(line => {
+            const idm = line.match(/^  ([a-zA-Z0-9_-]+):\s*$/);
+            if (idm) { curId = idm[1]; extras[curId] = []; return; }
+            if (!curId || !/^ {4,}\S/.test(line)) return;
+            if (/^ {4}(base_url|api_key|default_model):/.test(line)) return;
+            extras[curId].push(line);
+          });
+          Object.keys(extras).forEach(k => { if (!extras[k].length) delete extras[k]; });
+        } catch (e) {}
+        return extras;
+      };
+      const _collectModelExtras = (yml) => {
+        const lines = [];
+        try {
+          const m = String(yml || "").match(/^model:\n([\s\S]*?)(?=^[a-zA-Z_][a-zA-Z0-9_-]*:|\n\S|(?![\s\S]))/m);
+          if (!m) return lines;
+          m[1].split("\n").forEach(line => {
+            if (/^ {2}(provider|default|default_model):/.test(line)) return;
+            if (/^ {2,}\S/.test(line)) lines.push(line);
+          });
+        } catch (e) {}
+        return lines;
+      };
+      let _existingYml = "";
+      try { _existingYml = existsSync(yamlPath) ? readFileSync(yamlPath, "utf8") : ""; } catch (e) {}
+      const _provExtras = _collectProviderExtras(_existingYml);
+      const _modelExtraLines = _collectModelExtras(_existingYml);
+
       // YAML 标量安全序列化：含 YAML 特殊字符时加引号，否则保持 plain（匹配 Hermes 文档格式）
       const yamlScalar = (val) => {
         const s = String(val == null ? "" : val);
@@ -9495,17 +9532,21 @@ async function handleFetch(req) {
           }
           // 段名用 PROVIDER_HERMES_IDS 映射（openai→openai-api），与 model.provider 对齐
           const hermesId = PROVIDER_HERMES_IDS[id] || id;
+          // 该 provider 在现有 config.yaml 里面板不管理的字段（如 extra_headers），原样回填
+          const extra = (_provExtras[hermesId] || []).join("\n");
           // 本地模型（local-* 动态 id）：本地 OpenAI 兼容服务无需鉴权
           if (String(id).indexOf("local-") === 0) {
             return `  ${hermesId}:\n` +
                    `    base_url: ${yamlScalar(baseUrl)}\n` +
-                   `    default_model: ${yamlScalar(pcfg.model || "auto")}`;
+                   `    default_model: ${yamlScalar(pcfg.model || "auto")}` +
+                   (extra ? "\n" + extra : "");
           }
           const envVar = PROVIDER_API_KEYS[id] || customEnvKey(id);
           return `  ${hermesId}:\n` +
                  `    base_url: ${yamlScalar(baseUrl)}\n` +
                  `    api_key: \${${envVar}}\n` +
-                 `    default_model: ${yamlScalar(pcfg.model || "auto")}`;
+                 `    default_model: ${yamlScalar(pcfg.model || "auto")}` +
+                 (extra ? "\n" + extra : "");
         })
         .filter(Boolean);
       const providersBlock = customEntries.length > 0 ? `providers:\n${customEntries.join("\n")}\n` : "";
@@ -9515,7 +9556,8 @@ async function handleFetch(req) {
         let ymlContent = existsSync(yamlPath) ? readFileSync(yamlPath, "utf8") : "";
         // model.provider 经 PROVIDER_HERMES_IDS 映射（openai → openai-api，其余用自身 id）
         const hermesProvider = PROVIDER_HERMES_IDS[providerId] || providerId;
-        newModel = `model:\n  provider: ${hermesProvider}\n  default: ${resolvedModel}`;
+        newModel = `model:\n  provider: ${hermesProvider}\n  default: ${resolvedModel}` +
+          (_modelExtraLines.length ? "\n" + _modelExtraLines.join("\n") : "");
         // 用单一可靠函数替换 model / providers 顶层块：兼容 inline 与 block 两种形态，
         // 且无论文件里残留多少重复顶层键（重复 model:/providers: 是「No inference provider configured」的根因），
         // 都只保留我们写入的这一份，彻底消除配置漂移导致的网关 502。
